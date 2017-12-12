@@ -1,11 +1,18 @@
 <?php
 namespace danrevah\SandboxBundle\Managers;
 
+use danrevah\SandboxBundle\Annotation\AbstractApiSandboxAnnotation;
+use danrevah\SandboxBundle\Annotation\ApiSandboxMultiResponse;
+use danrevah\SandboxBundle\Annotation\ApiSandboxResponse;
+use danrevah\SandboxBundle\Annotation\ParameterProviderInterface;
 use danrevah\SandboxBundle\Enum\ApiSandboxResponseTypeEnum;
+use danrevah\SandboxBundle\Event\AnnotationEvent;
+use danrevah\SandboxBundle\Event\SandboxEvents;
 use Doctrine\Common\Annotations\AnnotationReader;
 use Doctrine\Common\Collections\ArrayCollection;
 use ReflectionMethod;
 use RuntimeException;
+use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\ParameterBag;
 use Symfony\Component\HttpFoundation\Response;
@@ -21,18 +28,29 @@ class SandboxResponseManager {
      * @var \Doctrine\Common\Annotations\AnnotationReader
      */
     private $annotationsReader;
+
+    /**
+     * @var boolean
+     */
     private $forceMode;
 
     /**
-     * @param KernelInterface $kernel
-     * @param $forceMode
-     * @param \Doctrine\Common\Annotations\AnnotationReader $annotationsReader
+     * @var EventDispatcherInterface
      */
-    public function __construct($kernel, $forceMode, AnnotationReader $annotationsReader)
+    private $dispatcher;
+
+    /**
+     * @param KernelInterface $kernel
+     * @param boolean $forceMode
+     * @param \Doctrine\Common\Annotations\AnnotationReader $annotationsReader
+     * @param EventDispatcherInterface $dispatcher
+     */
+    public function __construct($kernel, $forceMode, AnnotationReader $annotationsReader, EventDispatcherInterface $dispatcher)
     {
         $this->kernel = $kernel;
         $this->annotationsReader = $annotationsReader;
         $this->forceMode = $forceMode;
+        $this->dispatcher = $dispatcher;
     }
 
     /**
@@ -59,18 +77,14 @@ class SandboxResponseManager {
 
         // Step [1] - Single Response Annotation
         /** @var \StdClass $apiResponseAnnotation */
-        $apiResponseAnnotation = $reader->getMethodAnnotation(
-            $reflectionMethod,
-            'danrevah\SandboxBundle\Annotation\ApiSandboxResponse'
-        );
+        $annotations = $reader->getMethodAnnotations($reflectionMethod);
 
-        /** @var \StdClass $apiResponseMultiAnnotation */
-        $apiResponseMultiAnnotation = $reader->getMethodAnnotation(
-            $reflectionMethod,
-            'danrevah\SandboxBundle\Annotation\ApiSandboxMultiResponse'
-        );
+        $annotation = $this->findAnnotation($annotations);
 
-        if ( ! $apiResponseAnnotation && ! $apiResponseMultiAnnotation) {
+        $event = new AnnotationEvent($annotation, $annotations);
+        $this->dispatcher->dispatch(SandboxEvents::ANNOTATION_READ, $event);
+
+        if ( ! $annotation ) {
             // Disabled exception, continue to real controller
             $forceMode = $this->forceMode;
 
@@ -85,28 +99,32 @@ class SandboxResponseManager {
             }
         }
 
-        $parameters = $apiResponseAnnotation ? $apiResponseAnnotation->parameters : $apiResponseMultiAnnotation->parameters;
+        $this->getParameters($annotation);
+
+        $event = new AnnotationEvent($annotation, $annotations);
+        $this->dispatcher->dispatch(SandboxEvents::PARAMETERS_READ, $event);
 
         // Validating with Annotation syntax
-        $this->validateParamsArray($parameters, $rawRequest, $request, $query);
+        $this->validateParamsArray($annotation->parameters, $rawRequest, $request, $query);
 
         // Single response annotation is checked first
-        if ($apiResponseAnnotation) {
-            $responsePath = $apiResponseAnnotation->resource;
-            $type = $apiResponseAnnotation->type;
-            $statusCode = $apiResponseAnnotation->responseCode;
+        if ($annotation instanceof ApiSandboxResponse) {
+            $responsePath = $annotation->resource;
+            $type = $annotation->type;
+            $statusCode = $annotation->responseCode;
         } else {
             // Get response
+            /** @var ApiSandboxMultiResponse $annotation */
             list($responsePath, $type, $statusCode) = $this->getResource(
-                $apiResponseMultiAnnotation,
+                $annotation,
                 $rawRequest,
                 $request,
                 $query
             );
         }
 
-        if ($responsePath === null && $apiResponseMultiAnnotation) {
-            list($type, $statusCode, $responsePath) = $this->extractRealParams($apiResponseMultiAnnotation, $type, $statusCode);
+        if ($responsePath === null && $annotation instanceof ApiSandboxMultiResponse) {
+            list($type, $statusCode, $responsePath) = $this->extractRealParams($annotation, $type, $statusCode);
         }
 
         list($controller, $content) = $this->getControllerResponseByResource($responsePath, $type, $statusCode);
@@ -115,7 +133,7 @@ class SandboxResponseManager {
     }
 
     /**
-     * @param \StdClass $apiResponseMultiAnnotation
+     * @param ApiSandboxMultiResponse $apiResponseMultiAnnotation
      * @param $streamParams
      * @param $request
      * @param $query
@@ -123,7 +141,7 @@ class SandboxResponseManager {
      * @return array
      */
     private function getResource(
-        \StdClass $apiResponseMultiAnnotation,
+        ApiSandboxMultiResponse $apiResponseMultiAnnotation,
         ArrayCollection $streamParams,
         ParameterBag $request,
         ParameterBag $query
@@ -167,12 +185,23 @@ class SandboxResponseManager {
     ) {
         // search for missing required parameters and throw exception if there's anything missing
         foreach ($apiDocParams as $options) {
-            // Validating if required parameters are missing
-            if (array_key_exists('required', $options) && $options['required'] &&
-                ( ! $request->has($options['name']) && ! $query->has($options['name']) &&
-                    ! $rawRequest->containsKey($options['name']))
-            ) {
-                throw new \InvalidArgumentException('Missing parameters');
+            if ($request->has($options['name'])) {
+                $value = $request->get($options['name']);
+            } elseif ($query->has($options['name'])) {
+                $value = $query->get($options['name']);
+            } elseif ($rawRequest->containsKey($options['name'])) {
+                $value = $rawRequest->get($options['name']);
+            } else {
+                // Validating if required parameters are missing
+                if (isset($options['required']) && $options['required'] && empty($value) ) {
+                    throw new \InvalidArgumentException(sprintf('Missing parameter "%s".', $options['name']));
+                }
+            }
+
+            if (isset($options['format'])) {
+                if (-1 == preg_match('@^'.$options['format'].'$@', $value)) {
+                    throw new \InvalidArgumentException(sprintf('Value "%s" does not match format "%s"', $value, $options['format']));
+                }
             }
         }
     }
@@ -217,13 +246,13 @@ class SandboxResponseManager {
     }
 
     /**
-     * @param \StdClass $apiResponseMultiAnnotation
+     * @param ApiSandboxMultiResponse $apiResponseMultiAnnotation
      * @param $type
      * @param $statusCode
      * @throws \RuntimeException
      * @return array
      */
-    private function extractRealParams(\StdClass $apiResponseMultiAnnotation, $type, $statusCode)
+    private function extractRealParams(ApiSandboxMultiResponse $apiResponseMultiAnnotation, $type, $statusCode)
     {
         // If didn't find route path, fall to responseFallback
         if (empty($apiResponseMultiAnnotation->responseFallback) || ! isset($apiResponseMultiAnnotation->responseFallback['resource'])) {
@@ -286,6 +315,38 @@ class SandboxResponseManager {
             $responseCode = $resource['responseCode'];
         }
         $resourcePath = $resource['resource'];
+
         return array($type, $responseCode, $resourcePath);
+    }
+
+    /**
+     * @param array $annotations
+     *
+     * @return AbstractApiSandboxAnnotation|null
+     */
+    private function findAnnotation(array $annotations)
+    {
+        foreach ($annotations as $annotation) {
+            if ($annotation instanceof AbstractApiSandboxAnnotation) {
+                return $annotation;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Load parameters from resource or array
+     *
+     * @param AbstractApiSandboxAnnotation $annotation
+     */
+    private function getParameters(AbstractApiSandboxAnnotation $annotation)
+    {
+        if (!empty($annotation->parametersResource)) {
+            $path = $this->kernel->locateResource($annotation->parametersResource);
+            $content = file_get_contents($path);
+
+            $annotation->parameters = json_decode($content, true);
+        }
     }
 }

@@ -2,14 +2,13 @@
 
 namespace danrevah\SandboxBundle\Annotation;
 
-use danrevah\SandboxBundle\Enum\ApiSandboxResponseTypeEnum;
 use Doctrine\Common\Annotations\Annotation;
 
 /**
  * @Annotation
  * @Target({"METHOD"})
  */
-final class ApiSandboxResponse extends Annotation
+class ApiSandboxResponse extends AbstractApiSandboxAnnotation
 {
     /**
      * Resource path for response
@@ -19,23 +18,4 @@ final class ApiSandboxResponse extends Annotation
      *      resource="@SandboxBundle/Resources/responses/token.json"
      */
     public $resource;
-
-    // Default response type is JSON
-    public $type = ApiSandboxResponseTypeEnum::JSON_RESPONSE;
-
-    // Response code to output, default is 200
-    public $responseCode = 200;
-
-    /**
-     * Request parameters object
-     * @var array
-     *
-     * Example:
-     *      parameters = {
-     *          {"name"="param1", "required"=true},
-     *          {"name"="param2", "required"=false}
-     *      }
-     */
-    public $parameters = [];
-
 }
